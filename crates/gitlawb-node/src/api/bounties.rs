@@ -456,21 +456,68 @@ pub async fn dispute_bounty(
     Ok(Json(updated))
 }
 
+/// Resolve the set of `(owner_did, name)` pairs for repos an anonymous caller
+/// can list.  Mirrors the `stats()` pattern in `server.rs` (#104): batch-load
+/// all deduped repos, batch-load their visibility rules, keep only those that
+/// pass `listable_at_root`.  Pure I/O after the two DB round-trips — no
+/// per-repo authorization queries.
+///
+/// Both bounty stats handlers mount behind `optional_signature` (see
+/// `bounty_read_routes` in server.rs), so the caller is always `None` for
+/// anonymous access.  Every caller, signed or not, currently receives the
+/// anonymous-scoped aggregates (matching the #104 pattern); per-caller
+/// visibility can be threaded through here when that work lands.
+async fn visible_repo_pairs(state: &AppState) -> Vec<(String, String)> {
+    let result: std::result::Result<Vec<(String, String)>, anyhow::Error> = async {
+        let rows = state.db.list_all_repos_deduped().await?;
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let rules_by_repo = state.db.list_visibility_rules_for_repos(&ids).await?;
+        let pairs = rows
+            .iter()
+            .filter(|r| {
+                let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
+                crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, None)
+            })
+            .map(|r| (crate::db::normalize_owner_key(&r.owner_did).to_string(), r.name.clone()))
+            .collect();
+        Ok(pairs)
+    }
+    .await;
+    // Fail closed: DB error → empty set → all counts collapse to 0, never
+    // leaking existence of private repos.
+    result.unwrap_or_default()
+}
+
 /// GET /api/v1/bounties/stats
+///
+/// Aggregates are restricted to anonymously-listable repos so private-repo
+/// bounty activity is not exposed (#477).  The visible-repo set is resolved
+/// once per request via `visible_repo_pairs` (two SQL round-trips), then
+/// passed into the filtered aggregate queries.
 pub async fn bounty_stats(State(state): State<AppState>) -> Result<Json<BountyStatsResponse>> {
-    let open = state.db.count_bounties_by_status("open").await.unwrap_or(0);
+    let visible = visible_repo_pairs(&state).await;
+
+    let open = state
+        .db
+        .count_bounties_by_status_visible("open", &visible)
+        .await
+        .unwrap_or(0);
     let claimed = state
         .db
-        .count_bounties_by_status("claimed")
+        .count_bounties_by_status_visible("claimed", &visible)
         .await
         .unwrap_or(0);
     let completed = state
         .db
-        .count_bounties_by_status("completed")
+        .count_bounties_by_status_visible("completed", &visible)
         .await
         .unwrap_or(0);
 
-    let leaders = state.db.bounty_leaderboard(10).await.unwrap_or_default();
+    let leaders = state
+        .db
+        .bounty_leaderboard_visible(10, &visible)
+        .await
+        .unwrap_or_default();
     let leaderboard = leaders
         .into_iter()
         .map(|(did, cnt, total)| AgentBountyEntry {
@@ -489,14 +536,22 @@ pub async fn bounty_stats(State(state): State<AppState>) -> Result<Json<BountySt
 }
 
 /// GET /api/v1/agents/{did}/bounties
+///
+/// Per-agent earnings restricted to anonymously-listable repos (#477).
 pub async fn agent_bounty_stats(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let (count, total) = state.db.agent_bounty_stats(&did).await.unwrap_or((0, 0));
+    let visible = visible_repo_pairs(&state).await;
+    let (count, total) = state
+        .db
+        .agent_bounty_stats_visible(&did, &visible)
+        .await
+        .unwrap_or((0, 0));
     Ok(Json(serde_json::json!({
         "did": did,
         "completed_bounties": count,
         "total_earned": total,
     })))
 }
+
